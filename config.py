@@ -70,4 +70,4 @@ def setup_config():
     save_config(config)
     print("\n[+] Config tersimpan!")
     return config
-  
+    
