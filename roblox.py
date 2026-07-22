@@ -25,10 +25,16 @@ def join_private_server(package, config):
 
     if link:
         print(f"[*] {package}: Injecting Link Private Server...")
-        cmd = f"su -c \"am start -a android.intent.action.VIEW -d '{link}' {package}\""
-        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(8) # Double tap
-        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Hilangkan shell=True dan pakai format list agar link '&' tidak terputus di terminal
+        cmd = [
+            "su", 
+            "-c", 
+            f"am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d '{link}' {package}"
+        ]
+        
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(10) # Kasih jeda 10 detik buat double-tap
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def check_in_game_error(package):
     try:
@@ -48,4 +54,4 @@ def check_in_game_error(package):
     except Exception:
         pass
     return False
-  
+    
