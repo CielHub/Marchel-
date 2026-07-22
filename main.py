@@ -41,7 +41,8 @@ class CloneMonitor:
                 time.sleep(delay)
                 
                 if launch_game(self.package):
-                    time.sleep(15) # Tunggu engine siap
+                    print(f"[*] {self.package}: Menunggu game siap (25 detik)...")
+                    time.sleep(25) # Diperlama biar engine Roblox siap nerima link
                     join_private_server(self.package, self.config)
                     
                 self.is_recovering = False
@@ -99,4 +100,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
+    
