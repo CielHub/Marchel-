@@ -1,10 +1,12 @@
 import time
 import subprocess
+import threading
 
 class Launcher:
     """
-    Bertanggung jawab atas eksekusi pemulihan aplikasi target (Roblox).
-    Berinteraksi langsung dengan subsistem ActivityManager (am) Android via akses root.
+    Sub-Sistem Eksekusi Aplikasi (Multi-Package Target).
+    Dilengkapi dengan Serialization Lock (Mutex) untuk mencegah Android
+    menjadi hang/freeze jika 5 aplikasi direstart secara bersamaan.
     """
     
     def __init__(self, config, logger, events, states):
@@ -13,104 +15,86 @@ class Launcher:
         self.events = events
         self.states = states
         
-        # Konfigurasi target
-        self.target_package = self.config.get("target_package", "com.roblox.client")
         self.target_activity = self.config.get("target_activity", "com.roblox.client.Activity")
-        
-        # Jeda waktu (detik) antara mematikan dan menghidupkan aplikasi
-        # Memberikan OS Android waktu untuk membersihkan Dalvik Heap dan Surface Flinger (VRAM)
         self.stop_delay = self.config.get("launcher_stop_delay", 3)
+        self.deeplink_url = self.config.get("roblox_deeplink", "")
+        
+        # MUTEX LOCK: Sangat krusial. Memastikan jika 5 package crash bersamaan,
+        # sistem akan memulihkannya satu per satu, tidak meledakkan CPU.
+        self._recovery_lock = threading.Lock()
 
     def _run_shell_cmd(self, cmd_list, timeout_sec=15):
-        """
-        Eksekusi perintah shell root dengan aman.
-        Mencegah kebuntuan (deadlock) pada sistem Termux apabila OS Android sedang lag ekstrem.
-        """
+        """Eksekusi cangkang (shell) dengan pengaman OOM OS."""
         try:
             subprocess.run(
                 cmd_list,
-                stdout=subprocess.DEVNULL, # Keluaran am start/force-stop tidak diperlukan
-                stderr=subprocess.DEVNULL, # Membuang limbah buffer
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL, 
                 timeout=timeout_sec,
                 check=False
             )
             return True
         except subprocess.TimeoutExpired:
-            self.logger.error(f"Timeout ({timeout_sec}s) saat mengeksekusi perintah peluncuran.")
+            self.logger.error(f"Timeout OS saat mengeksekusi launcher.")
             return False
         except Exception as e:
-            self.logger.error(f"Galat sistem saat memanggil shell root: {e}")
+            self.logger.error(f"Galat tingkat OS pada Launcher: {e}")
             return False
 
-    def force_stop(self):
-        """
-        Menghentikan paksa aplikasi untuk memastikan memori dibersihkan sebelum restart.
-        Menggunakan akses root karena Termux tidak memiliki privilese sistem.
-        """
-        self.logger.info(f"Menghentikan paksa (force-stop) paket: {self.target_package}...")
-        
-        cmd = ["su", "-c", f"am force-stop {self.target_package}"]
-        success = self._run_shell_cmd(cmd, timeout_sec=10)
-        
-        if success:
-            self.logger.info("Perintah force-stop berhasil dieksekusi.")
-        else:
-            self.logger.warning("Gagal atau terjadi delay saat force-stop.")
+    def force_stop(self, package_name):
+        """Mematikan secara paksa satu paket spesifik."""
+        self.logger.info(f"[{package_name}] Force-stop (Mengosongkan RAM)...")
+        cmd = ["su", "-c", f"am force-stop {package_name}"]
+        self._run_shell_cmd(cmd, timeout_sec=10)
 
-    def start_app(self):
+    def start_app(self, package_name):
         """
-        Meluncurkan aplikasi menggunakan Intent Android.
-        Menerapkan bendera pembersihan aktivitas (FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK)
-        dalam format heksadesimal (0x10008000) untuk mencegah kebocoran memori UI 
-        karena penumpukan tumpukan aktivitas (Activity Stack).
+        Meluncurkan paket secara bersih.
+        Tetap menyertakan flag FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK (0x10008000)
+        karena ini aman dan valid untuk mode Freeform (mengganti stack lama yang crash).
         """
-        self.logger.info("Meluncurkan ulang aplikasi target...")
+        self.logger.info(f"[{package_name}] Meluncurkan package...")
         
-        deeplink_url = self.config.get("roblox_deeplink", "")
-        
-        if deeplink_url:
-            # Menggunakan skema deeplink (contoh: roblox://placeId=...)
+        if self.deeplink_url:
             cmd = [
                 "su", "-c", 
-                f"am start -W -f 0x10008000 -a android.intent.action.VIEW -d '{deeplink_url}' {self.target_package}"
+                f"am start -W -f 0x10008000 -a android.intent.action.VIEW -d '{self.deeplink_url}' {package_name}"
             ]
         else:
-            # Menggunakan skema Activity standar
             cmd = [
                 "su", "-c",
-                f"am start -W -f 0x10008000 -n {self.target_package}/{self.target_activity}"
+                f"am start -W -f 0x10008000 -n {package_name}/{self.target_activity}"
             ]
 
-        # Waktu tunggu ekstra diberikan (20 detik) karena am start dengan parameter -W
-        # akan menunggu hingga aplikasi benar-benar merender frame pertama (Cold Start).
         success = self._run_shell_cmd(cmd, timeout_sec=20) 
-        
-        if success:
-            self.logger.info("Perintah peluncuran (am start) berhasil.")
-        else:
-            self.logger.error("Peluncuran tertunda atau gagal merespons.")
+        if not success:
+            self.logger.warning(f"[{package_name}] Respons peluncuran melampaui timeout OS.")
 
-    def trigger_recovery(self):
+    def trigger_recovery(self, package_name):
         """
-        Sekuens pemulihan penuh (Recovery Sequence).
-        Pemanggilan ini bersifat blocking (sinkron) agar mencegah Monitor 
-        memicu perulangan recovery sebelum proses pertama selesai (mencegah Race Condition).
+        Sekuens pemulihan untuk package tertentu.
+        Dibungkus dalam antrean (lock) agar OS Android dapat bernapas 
+        jika terjadi pemulihan ganda beruntun.
         """
-        self.logger.warning("Memulai Sekuens Pemulihan (Recovery)...")
-        self.states.update("recovery_status", "IN_PROGRESS")
-        
-        # 1. Pastikan aplikasi mati total (menghapus proses zombie)
-        self.force_stop()
-        
-        # 2. Beri waktu bagi subsistem memori Android untuk mendaur ulang RAM
-        time.sleep(self.stop_delay)
-        
-        # 3. Mulai ulang aplikasi secara bersih (Cold Start)
-        self.start_app()
-        
-        self.states.update("recovery_status", "COMPLETED")
-        self.logger.info("Sekuens Pemulihan selesai.")
-        
-        # Siarkan bahwa proses telah usai agar komponen lain (seperti Dashboard) dapat diperbarui
-        self.events.publish("RECOVERY_COMPLETED")
-      
+        # Jika lock sedang dipakai oleh package lain, thread akan antre di sini
+        with self._recovery_lock:
+            self.logger.warning(f"[{package_name}] >> Menjalankan Recovery Sequence...")
+            self.states.update(package_name, "recovery_status", "IN_PROGRESS")
+            
+            # 1. Matikan tuntas
+            self.force_stop(package_name)
+            
+            # 2. Beri jeda Android mendinginkan I/O dan Surface Flinger (Grafis)
+            time.sleep(self.stop_delay)
+            
+            # 3. Luncurkan ulang
+            self.start_app(package_name)
+            
+            self.states.update(package_name, "recovery_status", "COMPLETED")
+            self.logger.info(f"[{package_name}] >> Recovery Selesai.")
+            
+            self.events.publish("RECOVERY_COMPLETED", package_name=package_name)
+            
+            # Jeda antar recovery agar jika 5 package antre, CPU tidak spike
+            time.sleep(2)
+            
