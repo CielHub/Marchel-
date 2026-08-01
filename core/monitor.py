@@ -5,9 +5,9 @@ import threading
 
 class SystemMonitor:
     """
-    Jantung operasional CARRERA-HUB.
-    Bertugas memantau status aplikasi target (Roblox) secara terus-menerus
-    melalui utilitas shell Android.
+    Sistem Pemantauan Paralel (Multi-Package & Multi-Window).
+    Dirancang khusus untuk mengawasi 5-7 aplikasi dalam mode Floating/Freeform Window
+    tanpa membebani CPU dengan panggilan shell berulang (O(1) OS Call Complexity).
     """
 
     def __init__(self, config, logger, events, states, launcher):
@@ -18,144 +18,149 @@ class SystemMonitor:
         self.launcher = launcher
         
         self.running = False
-        self.target_package = self.config.get("target_package", "com.roblox.client")
         
-        # Konfigurasi toleransi
+        # Mendukung list package dari konfigurasi
+        self.target_packages = self.config.get("target_packages", ["com.roblox.client"])
+        
+        # Jika user salah mengisi string biasa, konversi menjadi list
+        if isinstance(self.target_packages, str):
+            self.target_packages = [self.target_packages]
+
         self.check_interval = self.config.get("monitor_interval", 5)
         self.max_failed_checks = self.config.get("max_failed_checks", 3)
-        self.failed_check_count = 0
+        self.post_recovery_delay = self.config.get("post_recovery_delay", 15)
         
+        # Melacak kegagalan per package terisolasi
+        self.failed_check_counts = {pkg: 0 for pkg in self.target_packages}
         self.monitor_thread = None
 
     def _run_shell_cmd(self, cmd_list):
-        """
-        Mengeksekusi perintah shell Android dengan aman.
-        Mencegah deadlock OS buffer dengan timeout dan membuang limbah stderr.
-        Tidak menggunakan shell=True untuk meminimalisasi footprint proses anak (Phantom Process Limit).
-        """
+        """Mengeksekusi perintah shell Android dengan proteksi timeout."""
         try:
             result = subprocess.run(
                 cmd_list,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
-                timeout=10
+                timeout=12
             )
             return result.stdout
         except subprocess.TimeoutExpired:
-            self.logger.warning(f"Timeout saat mengeksekusi: {' '.join(cmd_list)}")
+            # Tidak melakukan log error berlebihan agar tidak spam
             return ""
-        except Exception as e:
-            self.logger.error(f"Gagal mengeksekusi shell command {' '.join(cmd_list)}: {e}")
+        except Exception:
             return ""
 
-    def _is_process_running(self):
-        """Memeriksa apakah proses memiliki PID di memori menggunakan BusyBox/ToyBox via Root."""
-        # 'su -c pidof' digunakan karena Termux mungkin tidak memiliki akses /proc/<pid> aplikasi lain
-        output = self._run_shell_cmd(["su", "-c", f"pidof {self.target_package}"])
-        # Jika ada angka yang dikembalikan, berarti proses hidup
-        return bool(output.strip())
-
-    def _is_in_foreground(self):
+    def _evaluate_all_packages(self):
         """
-        Memeriksa apakah aplikasi berada di layar utama.
-        Menarik dumpsys window dan mem-parsingnya di Python (menghindari piping shell).
+        Melakukan satu kali penarikan status OS untuk semua package.
+        O(1) system call, O(N) pengecekan string di memori Python.
+        Sangat efisien untuk CPU Android dan menghindari batas Phantom Process.
         """
-        output = self._run_shell_cmd(["su", "-c", "dumpsys window windows"])
-        if not output:
-            return False
-            
-        # Mencari baris mCurrentFocus yang menandakan apa yang sedang tampil di layar
-        for line in output.splitlines():
-            if "mCurrentFocus" in line:
-                if self.target_package in line:
-                    return True
-                else:
-                    return False
-        return False
+        # 1. Menarik seluruh proses yang hidup di memori
+        ps_output = self._run_shell_cmd(["su", "-c", "ps -A"])
+        
+        # 2. Menarik seluruh informasi jendela (Freeform/Floating/Fullscreen)
+        window_output = self._run_shell_cmd(["su", "-c", "dumpsys window windows"])
 
-    def _evaluate_system_state(self):
-        """Melakukan evaluasi logika terhadap status aplikasi saat ini."""
-        is_running = self._is_process_running()
-        is_foreground = self._is_in_foreground()
+        # Jika OS tidak merespons (Lag ekstrem), tunda pengecekan siklus ini
+        if not ps_output or not window_output:
+            self.logger.warning("OS Android terlambat merespons. Menunggu siklus berikutnya...")
+            return
 
-        if is_running and is_foreground:
-            # Kondisi normal
-            if self.failed_check_count > 0:
-                self.logger.info("Aplikasi kembali normal dan terdeteksi di foreground.")
-            self.failed_check_count = 0
-            self.states.update("roblox_status", "RUNNING")
+        # 3. Evaluasi setiap package secara independen
+        for pkg in self.target_packages:
             
-        elif is_running and not is_foreground:
-            # Aplikasi hidup tetapi tertutup layar lain / terdorong ke background
-            self.failed_check_count += 1
-            self.logger.warning(f"Aplikasi di background (Gagal {self.failed_check_count}/{self.max_failed_checks}).")
-            self.states.update("roblox_status", "BACKGROUND")
+            # Memastikan state diinisialisasi
+            self.states.init_package(pkg)
+
+            # Cek apakah aplikasi ada di RAM (Proses hidup)
+            is_running = pkg in ps_output
             
+            # Cek apakah jendela aplikasi ada di memori grafis (Floating/Active)
+            # Kita tidak lagi mencari mCurrentFocus karena freeform window tidak selalu memegangnya
+            is_visible = pkg in window_output
+
+            self._process_package_state(pkg, is_running, is_visible)
+
+    def _process_package_state(self, pkg, is_running, is_visible):
+        """Logika mesin status (State Machine) untuk tiap individual package."""
+        
+        # Jika package dihentikan manual oleh user/sistem, lewati pemantauan
+        if not self.states.get(pkg, "is_active", True):
+            return
+
+        # KONDISI 1: Normal (Hidup dan Terlihat sebagai Floating Window/Fullscreen)
+        if is_running and is_visible:
+            if self.failed_check_counts[pkg] > 0:
+                self.logger.info(f"[{pkg}] Kembali beroperasi normal (Freeform/Visible).")
+            self.failed_check_counts[pkg] = 0
+            self.states.update(pkg, "roblox_status", "RUNNING")
+
+        # KONDISI 2: Aplikasi hidup di background tapi jendelanya tertutup (Minimize/Glitch)
+        elif is_running and not is_visible:
+            self.failed_check_counts[pkg] += 1
+            self.logger.warning(f"[{pkg}] Window tidak terdeteksi (Gagal {self.failed_check_counts[pkg]}/{self.max_failed_checks}).")
+            self.states.update(pkg, "roblox_status", "BACKGROUND_OR_HIDDEN")
+
+        # KONDISI 3: Aplikasi terbunuh (Crash/OOM/LMKD)
         else:
-            # Aplikasi tidak ditemukan di RAM (crash/tertutup)
-            self.failed_check_count += 1
-            self.logger.warning(f"Aplikasi tidak berjalan (Gagal {self.failed_check_count}/{self.max_failed_checks}).")
-            self.states.update("roblox_status", "CRASHED_OR_STOPPED")
+            self.failed_check_counts[pkg] += 1
+            self.logger.warning(f"[{pkg}] Proses mati (Gagal {self.failed_check_counts[pkg]}/{self.max_failed_checks}).")
+            self.states.update(pkg, "roblox_status", "CRASHED_OR_STOPPED")
 
-        # Trigger Recovery jika melebihi ambang batas toleransi
-        if self.failed_check_count >= self.max_failed_checks:
-            self.logger.error("Batas toleransi kegagalan tercapai. Memulai sekuens recovery...")
-            self.states.update("roblox_status", "RECOVERING")
+        # TRIGGER RECOVERY KHUSUS UNTUK PACKAGE INI
+        if self.failed_check_counts[pkg] >= self.max_failed_checks:
+            self.logger.error(f"[{pkg}] Batas toleransi terlampaui. Memulai recovery khusus...")
+            self.states.update(pkg, "roblox_status", "RECOVERING")
             
-            # Publikasikan event agar UI/Modul lain tahu
-            self.events.publish("RECOVERY_STARTED")
+            # Memicu launcher (Launcher sudah dilengkapi antrean agar aman)
+            self.events.publish("RECOVERY_STARTED", package_name=pkg)
             
-            # Reset counter agar tidak terjadi recovery loop beruntun
-            self.failed_check_count = 0 
+            # Eksekusi recovery melalui thread launcher, tidak memblokir monitor loop
+            # Kita buat thread lepas (fire and forget) karena Launcher punya Queue Lock sendiri
+            threading.Thread(
+                target=self._trigger_and_wait,
+                args=(pkg,),
+                daemon=True,
+                name=f"Recovery_{pkg}"
+            ).start()
             
-            # Panggil launcher secara sinkron (blocking thread ini) hingga restart selesai
-            self.launcher.trigger_recovery()
-            
-            # Beri waktu tambahan setelah recovery sebelum melanjutkan polling
-            time.sleep(self.config.get("post_recovery_delay", 15))
+            self.failed_check_counts[pkg] = 0 
+
+    def _trigger_and_wait(self, pkg):
+        """Jembatan eksekusi pemulihan yang aman."""
+        self.launcher.trigger_recovery(pkg)
+        time.sleep(self.post_recovery_delay)
 
     def _monitor_loop(self):
-        """Loop abadi yang diawasi dengan ketat penggunaan resource-nya."""
-        self.logger.info("Sistem pemantauan (Monitor Loop) berjalan...")
+        """Siklus abadi pengawas sistem."""
+        self.logger.info(f"Monitor Loop dimulai untuk {len(self.target_packages)} package(s).")
         iteration_count = 0
 
         while self.running:
             start_time = time.time()
             
-            # Eksekusi pengecekan utama
-            self._evaluate_system_state()
+            self._evaluate_all_packages()
 
-            # Manajemen Memori: Membersihkan garbage collector secara paksa setiap 20 siklus
-            # untuk menstabilkan footprint RAM di lingkungan Termux/Android.
+            # Garbage Collection paksa (Penting: membersihkan sisa dump string besar)
             iteration_count += 1
-            if iteration_count % 20 == 0:
+            if iteration_count % 15 == 0:
                 gc.collect()
 
-            # Menghitung durasi sisa untuk sleep guna mempertahankan interval yang konsisten
             elapsed = time.time() - start_time
             sleep_time = max(1.0, self.check_interval - elapsed)
-            
-            # Tidur hingga siklus berikutnya
             time.sleep(sleep_time)
 
     def start(self):
-        """Memulai modul di thread terpisah agar tidak memblokir main loop."""
         if self.running:
             return
-            
         self.running = True
-        self.monitor_thread = threading.Thread(
-            target=self._monitor_loop,
-            daemon=True,
-            name="SystemMonitorThread"
-        )
+        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True, name="SystemMonitorThread")
         self.monitor_thread.start()
 
     def stop(self):
-        """Menghentikan siklus pemantauan dengan aman."""
-        self.logger.info("Menghentikan SystemMonitor...")
         self.running = False
         if self.monitor_thread and self.monitor_thread.is_alive():
             self.monitor_thread.join(timeout=3.0)
-      
+            
